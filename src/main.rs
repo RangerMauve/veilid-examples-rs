@@ -1,9 +1,10 @@
-use anyhow::{anyhow, Result};
-use std::sync::Arc;
+use anyhow::{anyhow, Ok, Result};
+use std::{env, sync::Arc};
 use tokio::sync::mpsc::{self, Receiver};
 use veilid_core::{
-    api_startup_config, UpdateCallback, VeilidAPI, VeilidConfigBlockStore, VeilidConfigInner,
-    VeilidConfigProtectedStore, VeilidConfigTableStore, VeilidUpdate,
+    api_startup_config, DHTSchema, UpdateCallback, VeilidAPI, VeilidConfigBlockStore,
+    VeilidConfigInner, VeilidConfigProtectedStore, VeilidConfigTableStore, VeilidUpdate,
+    CRYPTO_KIND_VLD0,
 };
 
 #[tokio::main]
@@ -18,9 +19,57 @@ async fn main() {
         }
     });
 
-    handle.abort();
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() > 0 {
+        let command = &args[1];
+        println!("Running command {:?}", command);
+
+        if command.eq("dht-get-set") {
+            dht_set_get(&veilid).await.unwrap();
+        }
+    }
+
+    println!("Dropping update processor task");
 
     veilid.shutdown().await;
+
+    handle.abort();
+}
+
+async fn dht_set_get(veilid: &VeilidAPI) -> Result<()> {
+    let schema = DHTSchema::dflt(1)?;
+    let routing_context = veilid.routing_context()?;
+    let record = routing_context
+        .create_dht_record(schema, Some(CRYPTO_KIND_VLD0))
+        .await?;
+
+    let key = record.key();
+    let set_value = "Hello World";
+
+    println!("Setting value {:?} at key {:?}", set_value, key);
+
+    routing_context
+        .set_dht_value(*key, 0, set_value.as_bytes().to_vec(), None)
+        .await?;
+
+    println!("reading value back");
+
+    // Close the record when you're done with it
+    routing_context.close_dht_record(*key).await?;
+
+    // Make sure to re-open before reading again
+    let record = routing_context.open_dht_record(*key, None).await?;
+
+    let get_value = routing_context
+        .get_dht_value(*key, 0, true)
+        .await?
+        .unwrap()
+        .data()
+        .to_vec();
+
+    println!("Got value {:?}", String::from_utf8(get_value)?);
+    return Ok(());
 }
 
 async fn init_veilid() -> Result<(VeilidAPI, Receiver<VeilidUpdate>)> {
