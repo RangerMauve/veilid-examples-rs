@@ -1,40 +1,97 @@
 use anyhow::{anyhow, Ok, Result};
+use core::str;
 use std::{env, sync::Arc};
-use tokio::sync::mpsc::{self, Receiver};
+use tokio::{
+    sync::mpsc::{self, Receiver},
+    task::JoinHandle,
+};
 use veilid_core::{
-    api_startup_config, DHTSchema, UpdateCallback, VeilidAPI, VeilidConfigBlockStore,
+    api_startup_config, DHTSchema, RouteId, UpdateCallback, VeilidAPI, VeilidConfigBlockStore,
     VeilidConfigInner, VeilidConfigProtectedStore, VeilidConfigTableStore, VeilidUpdate,
-    CRYPTO_KIND_VLD0,
+    CRYPTO_KIND_VLD0, VALID_CRYPTO_KINDS,
 };
 
 #[tokio::main]
 async fn main() {
     println!("Hello, world!");
 
-    let (veilid, mut rx) = init_veilid().await.unwrap();
+    let (veilid, rx) = init_veilid().await.unwrap();
 
-    let handle = tokio::spawn(async move {
-        while let Some(update) = rx.recv().await {
-            println!("Got update!")
-        }
-    });
+    let mut handle: Option<JoinHandle<()>> = None;
 
     let args: Vec<String> = env::args().collect();
 
-    if args.len() > 0 {
+    if args.len() > 1 {
         let command = &args[1];
         println!("Running command {:?}", command);
 
         if command.eq("dht-get-set") {
+            handle = Some(log_updates(rx));
+
             dht_set_get(&veilid).await.unwrap();
+        } else if command.eq("private-route-app-message") {
+            private_route_app_message(&veilid, rx).await.unwrap();
         }
+    } else {
+        handle = Some(log_updates(rx));
     }
 
     println!("Dropping update processor task");
 
     veilid.shutdown().await;
 
+    if handle.is_some() {
+        handle.unwrap().abort();
+    }
+
+    println!("Goodbye!");
+}
+
+async fn private_route_app_message(
+    veilid: &VeilidAPI,
+    mut rx: Receiver<VeilidUpdate>,
+) -> Result<()> {
+    let (tx_got_message, mut rx_got_message) = mpsc::channel(1);
+    // This wrapper has retry logic
+    let (route_id, route_id_blob) = make_route(veilid).await?;
+
+    // Listen for app messages for your route elsewhere
+    let handle = tokio::spawn(async move {
+        while let Some(update) = rx.recv().await {
+            if let VeilidUpdate::AppMessage(app_message) = update {
+                println!("got app message in manager");
+                if !app_message.route_id().is_some() {
+                    println!("app message without route");
+                }
+                let got_route_id = app_message.route_id().unwrap().to_owned();
+                if got_route_id != route_id {
+                    println!("app message for other route {:?}", got_route_id);
+                }
+                tx_got_message.send(app_message).await.unwrap();
+            }
+        }
+    });
+
+    // You only need the blob to import the route, store it on the DHT or share via link
+    // Make sure to import before sending app messages
+    let route_id = veilid.import_remote_private_route(route_id_blob)?;
+
+    veilid
+        .routing_context()?
+        .app_message(
+            veilid_core::Target::PrivateRoute(route_id),
+            "Hello World!".as_bytes().to_vec(),
+        )
+        .await?;
+
+    let app_message = rx_got_message.recv().await.unwrap();
+
+    let message = str::from_utf8(app_message.message())?;
+    println!("AppMessage {:?}", message);
+
     handle.abort();
+
+    return Ok(());
 }
 
 async fn dht_set_get(veilid: &VeilidAPI) -> Result<()> {
@@ -59,7 +116,7 @@ async fn dht_set_get(veilid: &VeilidAPI) -> Result<()> {
     routing_context.close_dht_record(*key).await?;
 
     // Make sure to re-open before reading again
-    let record = routing_context.open_dht_record(*key, None).await?;
+    let _record = routing_context.open_dht_record(*key, None).await?;
 
     let get_value = routing_context
         .get_dht_value(*key, 0, true)
@@ -130,4 +187,31 @@ async fn wait_for_network(rx: &mut Receiver<VeilidUpdate>) -> Result<()> {
         }
     }
     return Ok(());
+}
+
+fn log_updates(mut rx: Receiver<VeilidUpdate>) -> JoinHandle<()> {
+    return tokio::spawn(async move {
+        while let Some(_update) = rx.recv().await {
+            println!("Got update!")
+        }
+    });
+}
+
+async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
+    let mut retries = 3;
+    while retries != 0 {
+        retries -= 1;
+        let result = veilid
+            .new_custom_private_route(
+                &VALID_CRYPTO_KINDS,
+                veilid_core::Stability::Reliable,
+                veilid_core::Sequencing::PreferOrdered,
+            )
+            .await;
+
+        if result.is_ok() {
+            return Ok(result.unwrap());
+        }
+    }
+    return Err(anyhow!("Unable to create route, reached max retries"));
 }

@@ -7,4 +7,7 @@ cargo run
 
 # set dht record value and read it back
 cargo run -- dht-get-set
+
+# Make a private route and send it an app message
+cargo run -- private-route-app-message
 ```
