@@ -31,6 +31,8 @@ async fn main() {
             dht_set_get(&veilid).await.unwrap();
         } else if command.eq("private-route-app-message") {
             private_route_app_message(&veilid, rx).await.unwrap();
+        } else if command.eq("private-route-app-call") {
+            private_route_app_call(&veilid, rx).await.unwrap();
         }
     } else {
         handle = Some(log_updates(rx));
@@ -88,6 +90,57 @@ async fn private_route_app_message(
 
     let message = str::from_utf8(app_message.message())?;
     println!("AppMessage {:?}", message);
+
+    handle.abort();
+
+    return Ok(());
+}
+
+async fn private_route_app_call(veilid: &VeilidAPI, mut rx: Receiver<VeilidUpdate>) -> Result<()> {
+    let (tx_got_message, mut rx_got_message) = mpsc::channel(1);
+    // This wrapper has retry logic
+    let (route_id, route_id_blob) = make_route(veilid).await?;
+
+    let veilid_responder = veilid.clone();
+    // Listen for app messages for your route elsewhere
+    let handle = tokio::spawn(async move {
+        while let Some(update) = rx.recv().await {
+            if let VeilidUpdate::AppCall(app_call) = update {
+                println!("got app call in manager");
+                if !app_call.route_id().is_some() {
+                    println!("app call without route");
+                }
+                let got_route_id = app_call.route_id().unwrap().to_owned();
+                if got_route_id != route_id {
+                    println!("app call for other route {:?}", got_route_id);
+                }
+                let call_id = app_call.id();
+                tx_got_message.send(app_call).await.unwrap();
+                veilid_responder
+                    .app_call_reply(call_id, "Hey".as_bytes().to_vec())
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+
+    // You only need the blob to import the route, store it on the DHT or share via link
+    // Make sure to import before sending app messages
+    let route_id = veilid.import_remote_private_route(route_id_blob)?;
+
+    let response = veilid
+        .routing_context()?
+        .app_call(
+            veilid_core::Target::PrivateRoute(route_id),
+            "Hello World!".as_bytes().to_vec(),
+        )
+        .await?;
+
+    let app_call = rx_got_message.recv().await.unwrap();
+
+    let message = str::from_utf8(app_call.message())?;
+    println!("AppCall {:?}", message);
+    println!("Response {:?}", str::from_utf8(response.as_slice())?);
 
     handle.abort();
 
@@ -204,8 +257,8 @@ async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
         let result = veilid
             .new_custom_private_route(
                 &VALID_CRYPTO_KINDS,
-                veilid_core::Stability::Reliable,
-                veilid_core::Sequencing::PreferOrdered,
+                veilid_core::Stability::LowLatency,
+                veilid_core::Sequencing::NoPreference,
             )
             .await;
 
