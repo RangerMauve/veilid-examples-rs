@@ -151,7 +151,7 @@ async fn dht_set_get(veilid: &VeilidAPI) -> Result<()> {
     let schema = DHTSchema::dflt(1)?;
     let routing_context = veilid.routing_context()?;
     let record = routing_context
-        .create_dht_record(schema, Some(CRYPTO_KIND_VLD0))
+        .create_dht_record(schema, None, Some(CRYPTO_KIND_VLD0))
         .await?;
 
     let key = record.key();
